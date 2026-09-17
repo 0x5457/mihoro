@@ -17,7 +17,7 @@ use std::os::unix::prelude::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use colored::Colorize;
 use local_ip_address::local_ip;
 use reqwest::Client;
@@ -36,6 +36,22 @@ pub struct Mihoro {
     pub mihomo_target_config_path: String,
     pub mihomo_target_service_path: String,
 }
+
+const PROXY_URI_PROVIDER_FILE: &str = "mihoro-subscription.txt";
+const PROXY_URI_PROVIDER_CONFIG: &str = r#"proxy-providers:
+  mihoro-subscription:
+    type: file
+    path: ./mihoro-subscription.txt
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    use:
+      - mihoro-subscription
+
+rules:
+  - MATCH,PROXY
+"#;
 
 /// Outcome of a single setup stage, used by `mihoro init`.
 pub enum StageStatus {
@@ -149,6 +165,7 @@ impl Mihoro {
         let config_path = Path::new(&self.mihomo_target_config_path);
         if !force && config_path.exists() {
             // Re-apply TOML overrides onto the cached YAML so user changes take effect.
+            self.normalize_remote_config()?;
             let changed =
                 apply_mihomo_override(&self.mihomo_target_config_path, &self.config.mihomo_config)?;
             return if changed {
@@ -166,6 +183,7 @@ impl Mihoro {
         )
         .await?;
         try_decode_base64_file_inplace(&self.mihomo_target_config_path)?;
+        self.normalize_remote_config()?;
         apply_mihomo_override(&self.mihomo_target_config_path, &self.config.mihomo_config)?;
         Ok(StageStatus::Installed)
     }
@@ -399,6 +417,7 @@ impl Mihoro {
         // Try to decode base64 file in place if file is base64 encoding, otherwise do nothing
         try_decode_base64_file_inplace(&self.mihomo_target_config_path)?;
 
+        self.normalize_remote_config()?;
         apply_mihomo_override(&self.mihomo_target_config_path, &self.config.mihomo_config)?;
         println!(
             "{} Updated and applied config overrides",
@@ -471,6 +490,7 @@ impl Mihoro {
 
     pub async fn apply(&self) -> Result<()> {
         // Apply mihomo config override
+        self.normalize_remote_config()?;
         apply_mihomo_override(&self.mihomo_target_config_path, &self.config.mihomo_config).map(
             |_| {
                 println!(
@@ -583,6 +603,61 @@ impl Mihoro {
                 resolve_external_ui_path(&self.mihomo_target_config_root, external_ui)
             })
     }
+
+    /// Convert a downloaded URI subscription into a small Mihomo config.
+    ///
+    /// Mihomo accepts URI lists as proxy-provider content, but `mihoro` itself needs to write a
+    /// complete config before the core starts. Keeping the URI list in a separate local provider
+    /// file avoids reimplementing protocol-specific URI conversion here.
+    fn normalize_remote_config(&self) -> Result<()> {
+        let config_path = Path::new(&self.mihomo_target_config_path);
+        let raw_config = fs::read_to_string(config_path)?;
+        let is_yaml_mapping = matches!(
+            serde_yaml::from_str::<serde_yaml::Value>(&raw_config),
+            Ok(serde_yaml::Value::Mapping(_))
+        );
+
+        if is_yaml_mapping {
+            return Ok(());
+        }
+
+        if !looks_like_proxy_uri_list(&raw_config) {
+            bail!("remote subscription is neither a Mihomo YAML config nor a proxy URI list");
+        }
+
+        let provider_path =
+            Path::new(&self.mihomo_target_config_root).join(PROXY_URI_PROVIDER_FILE);
+        create_parent_dir(&provider_path)?;
+        fs::write(&provider_path, raw_config)?;
+        fs::write(config_path, PROXY_URI_PROVIDER_CONFIG)?;
+        Ok(())
+    }
+}
+
+fn looks_like_proxy_uri_list(content: &str) -> bool {
+    let mut found_uri = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let Some((scheme, _)) = line.split_once("://") else {
+            return false;
+        };
+        if scheme.is_empty()
+            || !scheme
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
+            || scheme.eq_ignore_ascii_case("https")
+        {
+            return false;
+        }
+        found_uri = true;
+    }
+
+    found_uri
 }
 
 fn installed_mihomo_version(binary_path: &str) -> Result<Option<String>> {
@@ -889,5 +964,70 @@ mod tests {
         assert_eq!(fs::read_to_string(&yaml_path)?, current_content);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_normalize_proxy_uri_subscription() -> Result<()> {
+        let dir = tempdir()?;
+        let config = Config {
+            remote_config_url: "http://example.com/subscription".to_string(),
+            mihomo_config_root: dir.path().to_string_lossy().into_owned(),
+            mihomo_binary_path: dir.path().join("mihomo").to_string_lossy().into_owned(),
+            user_systemd_root: dir.path().join("systemd").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+
+        let mihoro = Mihoro::from_config(config);
+        let uri_list = "vless://example.com:443?security=tls\nvmess://example.com:443\n";
+        fs::write(&mihoro.mihomo_target_config_path, uri_list)?;
+
+        mihoro.normalize_remote_config()?;
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join(PROXY_URI_PROVIDER_FILE))?,
+            uri_list
+        );
+        let generated: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&mihoro.mihomo_target_config_path)?)?;
+        assert_eq!(
+            generated["proxy-groups"][0]["use"][0],
+            serde_yaml::Value::String("mihoro-subscription".to_string())
+        );
+        assert_eq!(
+            generated["rules"][0],
+            serde_yaml::Value::String("MATCH,PROXY".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_remote_config_keeps_yaml_unchanged() -> Result<()> {
+        let dir = tempdir()?;
+        let config = Config {
+            remote_config_url: "http://example.com/config.yaml".to_string(),
+            mihomo_config_root: dir.path().to_string_lossy().into_owned(),
+            mihomo_binary_path: dir.path().join("mihomo").to_string_lossy().into_owned(),
+            user_systemd_root: dir.path().join("systemd").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+
+        let mihoro = Mihoro::from_config(config);
+        let yaml =
+            "proxies:\n  - name: test\n    type: http\n    server: example.com\n    port: 443\n";
+        fs::write(&mihoro.mihomo_target_config_path, yaml)?;
+
+        mihoro.normalize_remote_config()?;
+
+        assert_eq!(fs::read_to_string(&mihoro.mihomo_target_config_path)?, yaml);
+        assert!(!dir.path().join(PROXY_URI_PROVIDER_FILE).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_looks_like_proxy_uri_list_rejects_yaml_lines() {
+        assert!(looks_like_proxy_uri_list("ss://example\nvless://example"));
+        assert!(!looks_like_proxy_uri_list("proxies:\n  - name: test"));
+        assert!(!looks_like_proxy_uri_list("https://example.com"));
     }
 }

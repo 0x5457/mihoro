@@ -8,7 +8,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    Engine,
+};
 use colored::Colorize;
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
@@ -268,21 +271,29 @@ pub fn try_decode_base64_file_inplace(filepath: &str) -> Result<()> {
     // Read the file content into the buffer
     file.read_to_end(&mut base64_buf)?;
 
-    // Try to decode the base64 content
-    match BASE64_STANDARD.decode(&base64_buf) {
-        Ok(decoded_bytes) => {
-            // Truncate the file and seek to the beginning
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
+    // Providers commonly wrap Base64 across lines. Mihomo subscriptions also appear in
+    // URL-safe and unpadded forms, so try all four text encodings after removing whitespace.
+    let compact: Vec<u8> = base64_buf
+        .into_iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let decoded_bytes = [
+        STANDARD.decode(&compact),
+        STANDARD_NO_PAD.decode(&compact),
+        URL_SAFE.decode(&compact),
+        URL_SAFE_NO_PAD.decode(&compact),
+    ]
+    .into_iter()
+    .find_map(Result::ok);
 
-            // Write the decoded bytes back to the file
-            let mut writer = BufWriter::new(&file);
-            writer.write_all(&decoded_bytes)?;
-        }
-        Err(_) => {
-            // If decoding fails, do nothing and return Ok
-            return Ok(());
-        }
+    if let Some(decoded_bytes) = decoded_bytes {
+        // Truncate the file and seek to the beginning
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+
+        // Write the decoded bytes back to the file
+        let mut writer = BufWriter::new(&file);
+        writer.write_all(&decoded_bytes)?;
     }
 
     Ok(())
@@ -392,6 +403,26 @@ mod tests {
         let content = fs::read_to_string(&file_path)?;
         assert_eq!(content, "not valid base64!!!");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_decode_base64_file_inplace_accepts_wrapped_url_safe_base64() -> Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("test.txt");
+        let content = "vless://example.com:443?security=tls\nvmess://example.com:443";
+        let encoded = URL_SAFE_NO_PAD.encode(content.as_bytes());
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(20)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&file_path, wrapped)?;
+
+        try_decode_base64_file_inplace(file_path.to_str().unwrap())?;
+
+        assert_eq!(fs::read_to_string(&file_path)?, content);
         Ok(())
     }
 

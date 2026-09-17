@@ -57,6 +57,11 @@ Upon onboarding, `mihoro` will:
 - install and enable `mihomo.service`
 - start the service and print dashboard URLs for the configured controller
 
+The remote subscription may be a complete Mihomo YAML config or a Base64-encoded list of proxy
+URIs (`ss://`, `vmess://`, `vless://`, `trojan://`, and similar). For URI-list subscriptions,
+`mihoro` decodes the response into a local provider file and generates the minimal provider,
+proxy-group, and rule sections required by Mihomo.
+
 You can also proxy GitHub-hosted runtime downloads by setting `MIHORO_GITHUB_MIRROR` before commands such as `mihoro init` or `mihoro update`:
 
 ```shell
